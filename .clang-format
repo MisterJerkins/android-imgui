@@ -1,0 +1,32 @@
+BasedOnStyle: LLVM
+IndentWidth: 4
+# Calls, conditions and signatures stay on one line, whatever their length. A limit of 0 would
+# say the same, but then clang-format breaks before every constructor's initializers.
+ColumnLimit: 10000
+AccessModifierOffset: -4
+PointerAlignment: Left
+NamespaceIndentation: All
+FixNamespaceComments: false
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortLambdasOnASingleLine: All
+AllowShortEnumsOnASingleLine: true
+AlwaysBreakTemplateDeclarations: Yes
+InsertBraces: true
+IndentCaseLabels: true
+ReflowComments: false
+# A macro of several lines keeps its backslashes next to the code, not at the column limit.
+AlignEscapedNewlines: DontAlign
+SortIncludes: CaseSensitive
+IncludeBlocks: Regroup
+IncludeCategories:
+    - Regex: '^"(imgui|stb_)'
+      Priority: 2
+    - Regex: '^"'
+      Priority: 1
+    - Regex: '^<'
+      Priority: 3
+SpacesBeforeTrailingComments: 1
