@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Graphics/Blur.h"
 #include "Graphics/Texture.h"
 #include "Utils/Utils.h"
 #include "Window/ANativeWindowCreator.h"
@@ -45,6 +46,9 @@ public:
     virtual bool AfterNewFrame() = 0;
     // Right before `ImGui::Render`: draws what the input shows itself.
     virtual void BeforeRender() = 0;
+    // After `ImGui::Render`: how far up the frame's windows are drawn from where Dear ImGui
+    // has them.
+    virtual float GetLift() const = 0;
     // After the frame is drawn: tells where the interface is. `true` to have another frame.
     virtual bool AfterRender(const DisplayInfo& display) = 0;
 };
@@ -92,6 +96,8 @@ public:
     float GetScale() const;
     // Makes the whole interface larger or smaller, on top of the display's own density.
     void SetScale(float scale);
+    // The screen behind the interface, blurred: behind its windows, or behind any rectangle.
+    Blur& GetBlur();
     // The style before any scaling. Change sizes here, then call `SetScale`; colours can be
     // changed in `ImGui::GetStyle()` directly.
     ImGuiStyle& GetBaseStyle();
@@ -135,7 +141,6 @@ private:
     Result<> Wait(InputSource* input);
     Result<bool> Begin();
     Result<> Finish();
-
     NativeWindow window_;
     ImGuiContext* context_ = nullptr;
     std::weak_ptr<InputSource> input_;
@@ -143,6 +148,7 @@ private:
     uint64_t generation_ = 0;
     ImGuiStyle baseStyle_;
     float scale_ = 1.0f;
+    Blur blur_;
     Clock::time_point started_ = Clock::now();
     Clock::time_point polled_;
     Clock::time_point frameAt_;

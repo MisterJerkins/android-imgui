@@ -4,6 +4,7 @@
 #include "Window/ANativeWindowCreator.h"
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -43,6 +44,10 @@ private:
     GuiPtr object_ = nullptr;
 };
 
+// What a layer is: one with buffers to draw into, a bare holder of other layers, or one the
+// system draws by itself, with no picture of its own.
+enum class LayerKind : uint8_t { Drawn, Container, Effect };
+
 struct DisplayState {
     uint32_t width = 0;
     uint32_t height = 0;
@@ -80,8 +85,7 @@ public:
     Result<DisplayState> GetDisplayState(GuiPtr token) const;
     Result<GuiPtr> NewTransaction() const;
 
-    // Creates a layer with buffers to draw into, or a bare container for other layers.
-    Result<GuiPtr> CreateSurface(GuiPtr client, const char* name, uint32_t width, uint32_t height, Capture capture, bool container) const;
+    Result<GuiPtr> CreateSurface(GuiPtr client, const char* name, uint32_t width, uint32_t height, Capture capture, LayerKind layerKind) const;
     // The layer's `android::Surface`, with a reference of the caller's own.
     Result<GuiPtr> GetSurface(GuiPtr control) const;
     void Disconnect(GuiPtr control) const;
@@ -93,8 +97,20 @@ public:
     // Android version cannot resize a layer in place.
     Result<bool> Resize(GuiPtr transaction, GuiPtr control, uint32_t width, uint32_t height) const;
 
+    bool CanBlur() const {
+        return transact_.has_value() && transact_->setBlurRegions != nullptr && transact_->reparent != nullptr && transact_->setColor != nullptr;
+    }
+    // Makes the layer the blur is asked on: one with no picture of its own, under the picture
+    // of `parent` and captured as that is. The system blurs under the parts of a layer only
+    // where it draws that layer, and before Android 14 it does not draw the one a window
+    // belongs to: the window's picture is on a layer of its own inside it.
+    Result<GuiHandle> CreateBlurLayer(GuiPtr client, GuiPtr transaction, GuiPtr parent, Capture capture) const;
+    // Blurs what is under the given parts of a layer; none of them, no blur. With `shownAt` the
+    // change waits in the system for the frame that is shown at that moment.
+    Result<> SetBlur(GuiPtr transaction, GuiPtr control, std::span<const BlurRegion> regions, std::optional<std::chrono::steady_clock::time_point> shownAt) const;
+
     bool CanMirror() const {
-        return mirroring_.has_value() && transact_.has_value();
+        return mirroring_.has_value() && transact_.has_value() && transact_->reparent != nullptr;
     }
     // Shows a copy of `layer` on the display with the given layer stack, inside a container
     // that `place` can scale and move. Returns the copy and its container.
@@ -158,6 +174,13 @@ private:
         TxControl show = nullptr;
         TxControl hide = nullptr;
         TxSize setSize = nullptr;
+        GuiPtr (*reparent)(GuiPtr, const GuiPtr*, const GuiPtr*) = nullptr;
+        // Takes three half-precision numbers: red, green, blue.
+        GuiPtr (*setColor)(GuiPtr, const GuiPtr*, const std::array<uint16_t, 3>*) = nullptr;
+        // Takes a `std::vector<BlurRegion>` of the system's C++ library by reference.
+        GuiPtr (*setBlurRegions)(GuiPtr, const GuiPtr*, const void*) = nullptr;
+        // Takes nanoseconds on the clock that does not stop or jump.
+        GuiPtr (*setDesiredPresentTime)(GuiPtr, int64_t) = nullptr;
         TxBool trustedFlag = nullptr;
         TxInt trustedMode = nullptr;
         int32_t (*apply)(GuiPtr, bool) = nullptr;
@@ -179,7 +202,6 @@ private:
         Returned<GuiPtr> (*copy)(GuiPtr, GuiPtr) = nullptr;
         Returned<GuiPtr> (*copyCropped)(GuiPtr, GuiPtr, GuiPtr, GuiPtr) = nullptr;
         GuiPtr (*setStack)(GuiPtr, const GuiPtr*, uint32_t) = nullptr;
-        GuiPtr (*reparent)(GuiPtr, const GuiPtr*, const GuiPtr*) = nullptr;
         GuiPtr (*setMatrix)(GuiPtr, const GuiPtr*, float, float, float, float) = nullptr;
         GuiPtr (*setPosition)(GuiPtr, const GuiPtr*, float, float) = nullptr;
     };

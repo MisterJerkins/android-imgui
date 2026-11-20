@@ -12,6 +12,7 @@ constexpr int32_t FormatRgba8888 = 1;
 constexpr uint32_t FlagSkipScreenshot = 0x40;
 constexpr uint32_t FlagSecure = 0x80;
 constexpr uint32_t FlagContainer = 0x4000;
+constexpr uint32_t FlagEffect = 0x20000;
 constexpr int32_t WindowTypeDontScreenshot = 441'731;
 constexpr uint32_t MetadataWindowType = 2;
 constexpr int32_t TrustedOverlayEnabled = 2;
@@ -207,7 +208,7 @@ void LibGui::ResolveMirroring(Resolver& gui) {
     if (!gui.Optional(found.copy, "SurfaceComposerClient::mirrorSurface", {"_ZN7android21SurfaceComposerClient13mirrorSurfaceEPNS_14SurfaceControlE"}) && !gui.Optional(found.copyCropped, "SurfaceComposerClient::mirrorSurface", {"_ZN7android21SurfaceComposerClient13mirrorSurfaceEPNS_14SurfaceControlES2_S2_"})) {
         return;
     }
-    const bool complete = gui.Optional(found.setStack, "Transaction::setLayerStack", {"_ZN7android21SurfaceComposerClient11Transaction13setLayerStackERKNS_2spINS_14SurfaceControlEEENS_2ui10LayerStackE"}) && gui.Optional(found.reparent, "Transaction::reparent", {"_ZN7android21SurfaceComposerClient11Transaction8reparentERKNS_2spINS_14SurfaceControlEEES6_"}) && gui.Optional(found.setMatrix, "Transaction::setMatrix", {"_ZN7android21SurfaceComposerClient11Transaction9setMatrixERKNS_2spINS_14SurfaceControlEEEffff"}) && gui.Optional(found.setPosition, "Transaction::setPosition", {"_ZN7android21SurfaceComposerClient11Transaction11setPositionERKNS_2spINS_14SurfaceControlEEEff"});
+    const bool complete = gui.Optional(found.setStack, "Transaction::setLayerStack", {"_ZN7android21SurfaceComposerClient11Transaction13setLayerStackERKNS_2spINS_14SurfaceControlEEENS_2ui10LayerStackE"}) && gui.Optional(found.setMatrix, "Transaction::setMatrix", {"_ZN7android21SurfaceComposerClient11Transaction9setMatrixERKNS_2spINS_14SurfaceControlEEEffff"}) && gui.Optional(found.setPosition, "Transaction::setPosition", {"_ZN7android21SurfaceComposerClient11Transaction11setPositionERKNS_2spINS_14SurfaceControlEEEff"});
     if (complete) {
         mirroring_ = found;
     }
@@ -243,6 +244,10 @@ Result<> LibGui::ResolveOps(Resolver& gui) {
     TRY(gui.Required(transact.show, "Transaction::show", {"_ZN7android21SurfaceComposerClient11Transaction4showERKNS_2spINS_14SurfaceControlEEE"}));
     TRY(gui.Required(transact.hide, "Transaction::hide", {"_ZN7android21SurfaceComposerClient11Transaction4hideERKNS_2spINS_14SurfaceControlEEE"}));
     gui.Optional(transact.setSize, "Transaction::setSize", {"_ZN7android21SurfaceComposerClient11Transaction7setSizeERKNS_2spINS_14SurfaceControlEEEjj"});
+    gui.Optional(transact.reparent, "Transaction::reparent", {"_ZN7android21SurfaceComposerClient11Transaction8reparentERKNS_2spINS_14SurfaceControlEEES6_"});
+    gui.Optional(transact.setColor, "Transaction::setColor", {"_ZN7android21SurfaceComposerClient11Transaction8setColorERKNS_2spINS_14SurfaceControlEEERKNS_7details5TVec3INS_4halfEEE"});
+    gui.Optional(transact.setDesiredPresentTime, "Transaction::setDesiredPresentTime", {"_ZN7android21SurfaceComposerClient11Transaction21setDesiredPresentTimeEl", "_ZN7android21SurfaceComposerClient11Transaction21setDesiredPresentTimeEx"});
+    gui.Optional(transact.setBlurRegions, "Transaction::setBlurRegions", {"_ZN7android21SurfaceComposerClient11Transaction14setBlurRegionsERKNS_2spINS_14SurfaceControlEEERKNSt3__16vectorINS_10BlurRegionENS7_9allocatorIS9_EEEE"});
     transact_ = transact;
     return {};
 }
@@ -354,11 +359,11 @@ Result<GuiPtr> LibGui::NewTransaction() const {
     return ConstructInPlace("Transaction", [this](GuiPtr object) { transact_->constructCopy(object, object); });
 }
 
-Result<GuiPtr> LibGui::CreateSurface(GuiPtr client, const char* name, uint32_t width, uint32_t height, Capture capture, bool container) const {
+Result<GuiPtr> LibGui::CreateSurface(GuiPtr client, const char* name, uint32_t width, uint32_t height, Capture capture, LayerKind layerKind) const {
     const CreateKind kind = createVariant_.kind;
     const Parent parentKind = createVariant_.parent;
     const bool hidden = capture == Capture::Hidden;
-    uint32_t flags = (capture == Capture::Secure ? FlagSecure : 0) | (container ? FlagContainer : 0);
+    uint32_t flags = (capture == Capture::Secure ? FlagSecure : 0) | (layerKind == LayerKind::Container ? FlagContainer : layerKind == LayerKind::Effect ? FlagEffect : 0);
     Storage<512> metadata;
     Storage<64> name8;
 
@@ -485,14 +490,14 @@ Result<std::array<GuiHandle, 2>> LibGui::Mirror(GuiPtr client, GuiPtr transactio
         return Err("SurfaceFlinger refused to mirror the layer");
     }
     GuiHandle copy = GuiHandle::Adopt(copied);
-    GuiHandle root = GuiHandle::Adopt(TRY(CreateSurface(client, "android-imgui mirror", size[0], size[1], Capture::Visible, true)));
+    GuiHandle root = GuiHandle::Adopt(TRY(CreateSurface(client, "android-imgui mirror", size[0], size[1], Capture::Visible, LayerKind::Container)));
     const GuiPtr inner = copy.Get(), outer = root.Get();
     transact_->setLayer(transaction, &outer, INT32_MAX);
     mirroring_->setStack(transaction, &outer, stack);
     transact_->show(transaction, &outer);
     mirroring_->setStack(transaction, &inner, stack);
     transact_->show(transaction, &inner);
-    mirroring_->reparent(transaction, &inner, &outer);
+    transact_->reparent(transaction, &inner, &outer);
     TRY(Apply(*transact_, transaction));
     return std::array{std::move(copy), std::move(root)};
 }
@@ -503,6 +508,38 @@ Result<> LibGui::Place(GuiPtr transaction, GuiPtr layer, float scale, std::array
     }
     mirroring_->setMatrix(transaction, &layer, scale, 0.0f, 0.0f, scale);
     mirroring_->setPosition(transaction, &layer, offset[0], offset[1]);
+    return Apply(*transact_, transaction);
+}
+
+Result<GuiHandle> LibGui::CreateBlurLayer(GuiPtr client, GuiPtr transaction, GuiPtr parent, Capture capture) const {
+    if (!CanBlur()) {
+        return Err("this system does not blur what is under a layer");
+    }
+    // Android 12 takes such a layer only without a size.
+    GuiHandle made = GuiHandle::Adopt(TRY(CreateSurface(client, "android-imgui blur", 0, 0, capture, LayerKind::Effect)));
+    const GuiPtr layer = made.Get();
+    transact_->reparent(transaction, &layer, &parent);
+    // Under the layer inside the same parent that has the window's picture, and without the
+    // colour such a layer is otherwise filled with: minus one, three times over, is no colour.
+    const std::array<uint16_t, 3> none = {0xbc00, 0xbc00, 0xbc00};
+    transact_->setLayer(transaction, &layer, -1);
+    transact_->setColor(transaction, &layer, &none);
+    transact_->show(transaction, &layer);
+    TRY(Apply(*transact_, transaction));
+    return made;
+}
+
+Result<> LibGui::SetBlur(GuiPtr transaction, GuiPtr control, std::span<const BlurRegion> regions, std::optional<std::chrono::steady_clock::time_point> shownAt) const {
+    if (!CanBlur()) {
+        return Err("this system does not blur what is under a layer");
+    }
+    // The call copies the vector it is given. A vector of the system's library is three
+    // pointers - first, one past the last, end of storage - and that is what it gets.
+    const std::array<const BlurRegion*, 3> list = {regions.data(), regions.data() + regions.size(), regions.data() + regions.size()};
+    transact_->setBlurRegions(transaction, &control, &list);
+    if (shownAt && transact_->setDesiredPresentTime) {
+        transact_->setDesiredPresentTime(transaction, std::chrono::duration_cast<std::chrono::nanoseconds>(shownAt->time_since_epoch()).count());
+    }
     return Apply(*transact_, transaction);
 }
 

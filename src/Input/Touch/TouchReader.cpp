@@ -755,6 +755,10 @@ public:
         keyboard.Paint();
     }
 
+    float GetLift() const override {
+        return keyboard.GetLift();
+    }
+
     bool AfterRender(const DisplayInfo& display) override {
         const bool typing = keyboard.Finish();
         PublishView(display);

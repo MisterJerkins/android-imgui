@@ -5,12 +5,15 @@
 #include "Window/LibGui.h"
 #include "Window/Mirror.h"
 
+#include <algorithm>
 #include <android/native_window.h>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <mutex>
 #include <pthread.h>
 #include <stop_token>
@@ -142,6 +145,10 @@ struct WindowLayer {
     GuiPtr control = nullptr;
     GuiPtr surface = nullptr;
     ANativeWindow* window = nullptr;
+    // Whether the window's next buffers carry a moment to be shown at.
+    bool stamped = false;
+    // The layer the blur is asked on, once any was asked for.
+    GuiHandle blur;
 };
 
 struct NativeWindow::State {
@@ -161,6 +168,8 @@ struct NativeWindow::State {
     uint64_t generation = 0;
     bool visible = true;
     bool mirroring = false;
+    // The parts of the layer the system blurs under, kept for the layer that replaces this one.
+    std::vector<BlurRegion> blur;
     std::string error;
     std::unique_ptr<MirrorWorker> mirrors;
 
@@ -168,6 +177,39 @@ struct NativeWindow::State {
         mirrors.reset();
         Drop(retired);
         Drop(layer);
+    }
+
+    // The start of an `ANativeWindow` as the system lays it out, up to the call that changes
+    // what its next buffers carry.
+    struct WindowCalls {
+        int32_t magic;
+        int32_t version;
+        void* reserved[4];
+        void* incRef;
+        void* decRef;
+        uint32_t flags;
+        int32_t minSwapInterval;
+        int32_t maxSwapInterval;
+        float xdpi;
+        float ydpi;
+        intptr_t oem[4];
+        void* setSwapInterval;
+        void* dequeueOld;
+        void* lockOld;
+        void* queueOld;
+        void* query;
+        int (*perform)(ANativeWindow*, int, ...);
+    };
+
+    // The moment the window's next buffers ask to be shown at; none, as soon as they can be.
+    void Stamp(std::optional<std::chrono::steady_clock::time_point> shownAt) {
+        if (!shownAt && !layer.stamped) {
+            return;
+        }
+        // `NATIVE_WINDOW_SET_BUFFERS_TIMESTAMP`, with `NATIVE_WINDOW_TIMESTAMP_AUTO` for none.
+        const int64_t nanos = shownAt ? std::chrono::duration_cast<std::chrono::nanoseconds>(shownAt->time_since_epoch()).count() : std::numeric_limits<int64_t>::min();
+        reinterpret_cast<const WindowCalls*>(layer.window)->perform(layer.window, 7, nanos);
+        layer.stamped = shownAt.has_value();
     }
 
     // The window inside an `android::Surface`, with a reference of its own taken on it.
@@ -184,18 +226,27 @@ struct NativeWindow::State {
         return window;
     }
 
-    // The display's vsync period, tracked through the NDK choreographer (Android 11+).
-    static std::optional<std::chrono::nanoseconds> ChoreographerPeriod() {
+    // The display's own rhythm, asked of the NDK's choreographer (Android 7 and later). To a
+    // program without a Java machine the choreographer says nothing by itself, so it is asked
+    // to call at a few refreshes in a row, a few times a second for as long as frames go on.
+    struct Rhythm {
         using Prepare = void* (*)(int);
         using PollOnce = int (*)(int, int*, int*, void**);
         using GetInstance = void* (*)();
         using Callback = void (*)(int64_t, void*);
-        using Register = void (*)(void*, Callback, void*);
+        using Post = void (*)(void*, Callback, void*);
 
-        static std::atomic<uint64_t> periodNanos{0};
-        // The thread that listens lives for as long as the process does: a looper cannot be asked
-        // to stop from outside.
-        static const bool Started = [] {
+        static inline Post post = nullptr;
+        static inline std::atomic<void*> choreographer{nullptr};
+        // Nanoseconds on the clock that does not stop or jump. No period, nothing known yet.
+        static inline std::atomic<int64_t> at{0};
+        static inline std::atomic<int64_t> period{0};
+        static inline std::atomic<int64_t> asked{0};
+        static inline std::atomic<bool> asking{false};
+
+        // The thread that listens lives for as long as the process does: a looper cannot be
+        // asked to stop from outside.
+        static bool Start() {
             const auto android = Library::Open("libandroid.so");
             if (!android) {
                 return false;
@@ -203,32 +254,62 @@ struct NativeWindow::State {
             const auto prepare = android->Func<Prepare>("ALooper_prepare");
             const auto pollOnce = android->Func<PollOnce>("ALooper_pollOnce");
             const auto instance = android->Func<GetInstance>("AChoreographer_getInstance");
-            const auto subscribe = android->Func<Register>("AChoreographer_registerRefreshRateCallback");
-            if (!prepare || !pollOnce || !instance || !subscribe) {
+            post = android->Func<Post>("AChoreographer_postFrameCallback64");
+            // The older call counts the time in a `long`, which is as wide only on a 64-bit system.
+            if (!post && sizeof(long) == sizeof(int64_t)) {
+                post = android->Func<Post>("AChoreographer_postFrameCallback");
+            }
+            if (!prepare || !pollOnce || !instance || !post) {
                 return false;
             }
-
             std::thread([=] {
                 pthread_setname_np(pthread_self(), "vsync");
                 prepare(0);
-                void* choreographer = instance();
-                if (!choreographer) {
-                    return;
-                }
-                subscribe(choreographer, [](int64_t nanos, void*) { periodNanos.store(nanos > 0 ? static_cast<uint64_t>(nanos) : 0, std::memory_order_relaxed); }, nullptr);
+                choreographer.store(instance());
                 for (;;) {
                     pollOnce(-1, nullptr, nullptr, nullptr);
                 }
             }).detach();
             return true;
-        }();
-
-        const uint64_t nanos = periodNanos.load(std::memory_order_relaxed);
-        if (!Started || nanos == 0) {
-            return std::nullopt;
         }
-        return std::chrono::nanoseconds(nanos);
-    }
+
+        // Called by the choreographer on its thread at a refresh, with how many more refreshes
+        // to be called at. The shortest time between two of the run is the period.
+        static void OnRefresh(int64_t nanos, void* left) {
+            static int64_t before = 0, shortest = 0;
+            const auto more = reinterpret_cast<intptr_t>(left);
+            shortest = more == 2 ? std::numeric_limits<int64_t>::max() : std::min(shortest, nanos - before);
+            before = nanos;
+            if (more > 0) {
+                post(choreographer.load(), OnRefresh, reinterpret_cast<void*>(more - 1));
+                return;
+            }
+            // No display takes its frames less than two milliseconds or more than a tenth of a second apart.
+            if (shortest >= 2'000'000 && shortest <= 100'000'000) {
+                period.store(shortest);
+                at.store(nanos);
+            }
+            asking.store(false);
+        }
+
+        static std::optional<Vsync> Get() {
+            static const bool Started = Start();
+            void* const instance = choreographer.load();
+            if (!Started || !instance) {
+                return std::nullopt;
+            }
+            const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (now - asked.load() > 250'000'000 && !asking.exchange(true)) {
+                asked.store(now);
+                post(instance, OnRefresh, reinterpret_cast<void*>(intptr_t{2}));
+            }
+            const int64_t known = period.load();
+            if (known == 0) {
+                return std::nullopt;
+            }
+            return Vsync{.at = std::chrono::steady_clock::time_point(std::chrono::nanoseconds(at.load())), .period = std::chrono::nanoseconds(known)};
+        }
+    };
 
     static Result<std::shared_ptr<State>> Connect() {
         auto state = std::make_shared<State>();
@@ -250,7 +331,7 @@ struct NativeWindow::State {
 
     Result<WindowLayer> CreateLayer() const {
         WindowLayer made;
-        made.control = TRY(gui->CreateSurface(client, name.c_str(), display.width, display.height, capture, false));
+        made.control = TRY(gui->CreateSurface(client, name.c_str(), display.width, display.height, capture, LayerKind::Drawn));
         const auto finished = [&]() -> Result<> {
             made.surface = TRY(gui->GetSurface(made.control));
             made.window = TRY(AcquireWindow(made.surface));
@@ -307,7 +388,23 @@ struct NativeWindow::State {
         visible = true;
         generation++;
         MirrorLayer();
+        // The new layer starts without the blur the old one had.
+        if (const auto blurred = PlaceBlur(std::nullopt); !blurred) {
+            logger.Warn("{}", blurred.error().message);
+        }
         return {};
+    }
+
+    // Asks the system for the blur under the parts kept in `blur`. The layer it is asked on is
+    // made when there first is something to blur.
+    Result<> PlaceBlur(std::optional<std::chrono::steady_clock::time_point> shownAt) {
+        if (!layer.blur.Get()) {
+            if (blur.empty()) {
+                return {};
+            }
+            layer.blur = TRY(gui->CreateBlurLayer(client, transaction, layer.control, capture));
+        }
+        return gui->SetBlur(transaction, layer.blur.Get(), blur, shownAt);
     }
 };
 
@@ -358,11 +455,12 @@ uint32_t NativeWindow::GetApiLevel() const {
     return state_->gui->GetApi();
 }
 
-std::optional<std::chrono::nanoseconds> NativeWindow::GetVsyncPeriod() const {
-    if (const auto period = State::ChoreographerPeriod()) {
-        return period;
+std::optional<Vsync> NativeWindow::GetVsync() const {
+    if (const auto vsync = State::Rhythm::Get()) {
+        return vsync;
     }
-    return state_->reportedPeriod;
+    // An old system says how often its display takes a frame and not when: any moment will do.
+    return state_->reportedPeriod.transform([](std::chrono::nanoseconds period) { return Vsync{.at = {}, .period = period}; });
 }
 
 std::vector<std::string> NativeWindow::GetSymbols() const {
@@ -394,6 +492,28 @@ bool NativeWindow::SetCapture(Capture capture) {
 
 const std::string& NativeWindow::GetError() const {
     return state_->error;
+}
+
+bool NativeWindow::CanBlur() const {
+    // The compositor says in this property whether it was built to blur.
+    return state_->gui->CanBlur() && System::GetProperty("ro.surface_flinger.supports_background_blur") == "1";
+}
+
+Result<> NativeWindow::SetBlur(std::span<const BlurRegion> regions) {
+    State& state = *state_;
+    if (std::ranges::equal(regions, state.blur)) {
+        // The frame drawn for the last change has gone: those after it are shown as soon as they can be.
+        state.Stamp(std::nullopt);
+        return {};
+    }
+    state.blur.assign(regions.begin(), regions.end());
+    // The system takes a change like this at once, and a frame only after its turn in the
+    // window's queue, two of the display's frames later: a blur that moves with what is drawn
+    // would run ahead of it. So the change and the frame drawn for it are both told to be shown
+    // at one moment that far ahead, which keeps the frame no longer than the queue does anyway.
+    const auto shownAt = std::chrono::steady_clock::now() + 2 * GetVsync().transform([](const Vsync& vsync) { return vsync.period; }).value_or(std::chrono::nanoseconds(16'666'667));
+    state.Stamp(shownAt);
+    return state.PlaceBlur(shownAt);
 }
 
 bool NativeWindow::IsMirroring() const {

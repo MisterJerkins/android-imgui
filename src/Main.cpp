@@ -22,6 +22,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    Blur& blur = graphics->GetBlur();
     const std::string title = std::format("Android ImGui · {}", graphics->GetName());
     float scale = 1.0f;
     Capture capture = Capture::Visible;
@@ -45,6 +46,8 @@ int main(int argc, char** argv) {
                 const float turn = time * (0.3f + static_cast<float>(index) * 0.07f) + static_cast<float>(index) * 1.3f;
                 const float x = screen.x * (0.5f + 0.38f * std::cos(turn)), y = screen.y * (0.5f + 0.3f * std::sin(turn * 1.4f));
                 behind->AddLine({screen.x / 2.0f, screen.y}, {x, y + 90.0f}, IM_COL32(255, 255, 255, 90), 2.0f);
+                // The screen inside a box is blurred like the screen behind the menu.
+                blur.AddRect(behind, {x - 45.0f, y - 90.0f}, {x + 45.0f, y + 90.0f}, blur.GetWindowRadius());
                 behind->AddRect({x - 45.0f, y - 90.0f}, {x + 45.0f, y + 90.0f}, IM_COL32(80, 220, 120, 255), 0.0f, ImDrawFlags_None, 3.0f);
                 const std::string label = std::format("item {}", index);
                 const ImVec2 extent = ImGui::GetFont()->CalcTextSizeA(30.0f, FLT_MAX, 0.0f, label.c_str());
@@ -54,10 +57,15 @@ int main(int argc, char** argv) {
         }
 
         ImGui::SetNextWindowPos(ImVec2(screen.x / 2.0f, screen.y / 2.0f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+        // The blur behind the menu shows through a background that is not solid.
+        ImGui::SetNextWindowBgAlpha(blur.GetWindowRadius() > 0.0f ? 0.45f : 1.0f);
         if (ImGui::Begin(title.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::SliderFloat("Scale", &scale, 0.5f, 3.0f, "%.2f");
             if (ImGui::IsItemDeactivatedAfterEdit()) {
                 graphics->SetScale(scale);
+            }
+            if (float radius = blur.GetWindowRadius(); blur.IsAvailable() && ImGui::SliderFloat("Blur", &radius, 0.0f, 100.0f, "%.0f px")) {
+                blur.SetWindowRadius(radius);
             }
             int picked = std::to_underlying(capture);
             if (ImGui::Combo("Screenshots and recordings", &picked, "Visible\0Hidden\0Secure\0")) {

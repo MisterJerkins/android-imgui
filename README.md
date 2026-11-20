@@ -32,8 +32,8 @@ int main() {
 }
 ```
 
-thats the whole thing. the full demo (menu, scale slider, capture modes, touch control, moving
-"items") is [src/Main.cpp](src/Main.cpp), ~90 lines, all of it in `main`.
+thats the whole thing. the full demo (menu, scale and blur sliders, capture modes, touch control,
+moving "items") is [src/Main.cpp](src/Main.cpp), ~90 lines, all of it in `main`.
 
 ## Quick start
 
@@ -67,6 +67,7 @@ first arg picks the backend: `auto` (default), `gl`, `vk`, `cpu`.
 | capture | `Capture::Visible / Hidden / Secure` - keep the overlay out of screenshots and recordings |
 | mirroring | on android 14+ recorders only see window manager layers, so they miss the overlay. `window.SetMirroring(true)` copies it onto the recording display. off by default, and does nothing while the overlay is hidden |
 | draw | anything outside the menu goes through `ImGui::GetBackgroundDrawList()` - raw screen pixels, under the windows, never takes touches |
+| blur | android 12+: the screen behind the menu blurred by the system's own compositor - behind every window (`blur.SetWindowRadius`) or behind any rectangle you draw (`blur.AddRect`, shaped like `AddRectFilled`). nothing is drawn for it here, and the overlay does not redraw when what is behind it changes |
 | pictures | PNG / JPEG from memory or a file, or raw RGBA. works the same on all three backends |
 | no evdev | containers without touch devices: touches come from the system input monitor (android 10+) |
 
@@ -91,8 +92,14 @@ control mode, every backend pixel-compared against the others, capture, recordin
 "-" means that android version doesnt have the feature (recorders before 14 grab the whole
 screen anyway, input monitor showed up in 10).
 
-the unit tests (113 of them: touch protocols, device classification, routing, keyboards, the CPU
-rasterizer against a reference, picture decoding) run on the pc and on the tablet.
+the blur was checked wherever the system has one: the tablet and the android 12, 13, 14 and 16
+emulators, all three backends - a wide window, a small one, a grid of rounded rectangles, and an
+overlay hidden from screenshots, which takes its blur out of them too. on android 7 and 9, which
+have none, the same scenes run and the screen stays as it was.
+
+the unit tests (123 of them: touch protocols, device classification, routing, keyboards, the CPU
+rasterizer against a reference, picture decoding, what the blur asks the system for) run on the pc
+and on the tablet.
 
 not checked, because the test images dont have it:
 
@@ -153,6 +160,24 @@ tablet, Snapdragon 8 Elite (8 cores), 2400×1504 @ 60 Hz, android 15, release bu
 - all three backends draw the same picture: on every tested android they differ by 1-2 brightness
   levels in a few hundred pixels out of millions
 
+the blur, same tablet, a page animating at 60 fps under an overlay that stands still:
+
+| | compositor | gpu, of its full speed | overlay |
+|---|---|---|---|
+| no blur | ~21 % of one core | ~1.4 % | ~0.3 % of one core |
+| blur - any radius, any size, 1 to 64 parts | ~39 % | ~6.5 % | ~0.3 % |
+| 2 / 3 different radii in one frame | ~46 % / ~55 % | ~10 % / ~13 % | ~0.3 % |
+
+- the system does the blurring, so thats where the cost is: with a blur on screen its compositor
+  puts every frame together on the gpu and blurs it once per radius. the gpu stays at its lowest
+  clock through all of it
+- nothing moving behind the overlay - nothing spent: on a still screen the compositor does not run
+- the radius and the size are free, the number of *different* radii is not. 16 at once took half
+  the gpu and 64 dropped frames, so a frame gets three at most and a fourth takes the nearest
+- dragging a blurred window costs the overlay what dragging a plain one does (~10 % of a core on
+  Vulkan), and the blur stays on the window to the frame - checked frame by frame in a 60 fps
+  recording, all three backends
+
 ## API
 
 three steps, in this order, and then the frames:
@@ -181,6 +206,7 @@ what you talk to:
 graphics->RequestRepaint();                                   // another frame right after this one
 graphics->SetScale(1.5f);                                     // the whole ui bigger or smaller
 graphics->Close();                                            // the next NewFrame returns false
+graphics->GetBlur().SetWindowRadius(40.0f);                   // the screen behind every window, blurred (android 12+)
 window.GetDisplayInfo();                                      // size, rotation, density
 window.SetCapture(Capture::Hidden);                           // hide from screenshots and recordings
 window.SetMirroring(true);                                    // or show up in android 14+ recorders (off by default)
@@ -235,6 +261,32 @@ behind->AddLine({x, y}, {x2, y2}, IM_COL32_WHITE, 2.0f);
 behind->AddRect({x - 45, y - 90}, {x + 45, y + 90}, IM_COL32(80, 220, 120, 255), 0.0f, ImDrawFlags_None, 3.0f);
 behind->AddText(ImGui::GetFont(), 30.0f, {x, y - 128}, IM_COL32_WHITE, "item");
 ```
+
+blur - the screen behind the menu, blurred. its the system's own blur (the one behind the
+notification shade), not a shader of ours: nothing extra is drawn, and it follows whatever moves
+behind the overlay without the overlay redrawing.
+
+```cpp
+Blur& blur = graphics->GetBlur();
+blur.SetWindowRadius(40.0f);                                             // behind every window, in pixels. 0 turns it off
+
+while (graphics->NewFrame()) {
+    ImGui::SetNextWindowBgAlpha(0.45f);                                  // the blur shows through what is not solid
+    ImGui::Begin("Menu");
+    ImGui::End();
+
+    ImDrawList* behind = ImGui::GetBackgroundDrawList();                 // or behind anything you draw yourself:
+    blur.AddRect(behind, {100, 100}, {400, 300}, 60.0f, 16.0f);          // min, max, radius, rounding
+    behind->AddRectFilled({100, 100}, {400, 300}, IM_COL32(0, 0, 0, 90), 16.0f);
+    graphics->EndFrame();
+}
+```
+
+`AddRect` takes the draw list you draw the thing with and puts the blur exactly where
+`AddRectFilled` with the same arguments would put its rectangle: same place, same rounding, same
+clipping. it lasts one frame, like everything on a draw list. `blur.IsAvailable()` says whether
+this system can blur at all; where it cant, the calls just do nothing. keep to one radius when you
+can - every other radius in a frame is another pass over the screen for the system.
 
 pictures - load once before the loop, draw as much as you want:
 
@@ -322,7 +374,8 @@ demo.
 src/
     Main.cpp            the demo
     Window/             ANativeWindowCreator and NativeWindow - the layer; LibGui (the system's C++ ABI); Mirror for recorders
-    Graphics/           Graphics - the base class: frames, scale, pictures; GraphicsManager picks; Texture
+    Graphics/           Graphics - the base class: frames, scale, pictures; GraphicsManager picks; Texture;
+                        Blur - the screen behind, blurred
         OpenGL/         OpenGLGraphics, Egl
         Vulkan/         VulkanGraphics, VulkanLoader, Shaders/
         Software/       SoftwareGraphics, Rasterizer
@@ -352,6 +405,10 @@ tools/                  build scripts
   because it has to ask the system for its displays once a second (a `dumpsys` run each time).
   with it on, the first second of a recording can still be without the overlay, until the mirror
   picks up the new recording display
+- the blur needs android 12+ and a device whose compositor is built with it (most are; the
+  `ro.surface_flinger.supports_background_blur` property says). it lies under everything the
+  overlay draws, so it shows only through what is not solid - give the windows a see-through
+  background
 - the font is the system one (Roboto), so latin and cyrillic work out of the box. need CJK or
   your own font - add it through `ImGui::GetIO().Fonts`
 - ImGui's demo window and debug tools are compiled out (`IMGUI_DISABLE_DEMO_WINDOWS`,

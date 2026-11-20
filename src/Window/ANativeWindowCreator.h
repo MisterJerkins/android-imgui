@@ -97,6 +97,30 @@ private:
     size_t stride_;
 };
 
+// The display's own rhythm: the moment it took a frame, and the time between two of its frames.
+struct Vsync {
+    std::chrono::steady_clock::time_point at;
+    std::chrono::nanoseconds period{};
+};
+
+// A part of the layer under which the system blurs the screen, in the layer's own pixels and
+// laid out the way the system's library takes it. Whatever the layer draws there goes on top
+// of the blurred picture, so it shows where the layer is not opaque.
+struct BlurRegion {
+    uint32_t radius = 0;
+    float cornerTopLeft = 0.0f;
+    float cornerTopRight = 0.0f;
+    float cornerBottomLeft = 0.0f;
+    float cornerBottomRight = 0.0f;
+    float alpha = 1.0f;
+    int32_t left = 0;
+    int32_t top = 0;
+    int32_t right = 0;
+    int32_t bottom = 0;
+
+    bool operator==(const BlurRegion&) const = default;
+};
+
 // The layer over the whole screen, above everything else, and its window: what EGL, Vulkan and
 // the processor draw into. Copies are handles to the one layer, which goes when the last of
 // them does.
@@ -119,8 +143,8 @@ public:
     // The display's unique id as Android's input configuration names it.
     std::optional<std::string> GetDisplayId() const;
     uint32_t GetApiLevel() const;
-    // Time between two display refreshes, when the system reports it.
-    std::optional<std::chrono::nanoseconds> GetVsyncPeriod() const;
+    // When the display takes its frames, where the system tells.
+    std::optional<Vsync> GetVsync() const;
     // Which symbols of the system library are in use, one line each.
     std::vector<std::string> GetSymbols() const;
 
@@ -138,6 +162,15 @@ public:
     void SetMirroring(bool mirroring);
 
     Result<> SetVisible(bool visible);
+
+    // Whether the system blurs what is under a layer: Android 12 and later, on devices whose
+    // compositor is built for it.
+    bool CanBlur() const;
+    // Blurs the screen under the given parts of the layer; none of them, no blur. The system
+    // does the blurring itself, every time what is underneath changes, with nothing drawn here.
+    // To be called before the frame drawn for the change goes to the window: the two are then
+    // shown in the same display frame. What fails is not tried again until the parts change.
+    Result<> SetBlur(std::span<const BlurRegion> regions);
 
     // Takes up a rotated or resized display. `true` when it has changed.
     Result<bool> FollowDisplay();

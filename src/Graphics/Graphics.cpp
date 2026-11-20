@@ -21,7 +21,7 @@ static constexpr auto IdlePoll = 250ms;
 // tooltip, still appears. Frames that draw the same picture are not sent to the screen.
 static constexpr auto SettleTime = 500ms;
 
-Graphics::Graphics(const NativeWindow& window) : window_(window), generation_(window.GetGeneration()) {
+Graphics::Graphics(const NativeWindow& window) : window_(window), generation_(window.GetGeneration()), blur_(window.CanBlur()) {
     const DisplayInfo display = window_.GetDisplayInfo();
 
     IMGUI_CHECKVERSION();
@@ -124,12 +124,19 @@ void Graphics::Want(Clock::time_point at) {
     }
 }
 
-// Sleeps until a frame is due: no sooner than the display can show one, and not at all while
+// Sleeps until a frame is due: one for each of the display's at the most, and none while
 // nothing asks for one.
 Result<> Graphics::Wait(InputSource* input) {
-    const auto period = window_.GetVsyncPeriod();
-    // Without a refresh rate to go by, no display is faster than a frame in four milliseconds.
-    const Clock::time_point earliest = frameAt_ + (period ? std::chrono::duration_cast<Clock::duration>(*period) : Clock::duration(4ms));
+    // A frame begins once the display has taken its turn after the frame before began. Begun
+    // sooner it would wait in the window's queue, and hold back every frame after it for as
+    // long. Without the display's rhythm to go by, no display is faster than a frame in four
+    // milliseconds. Only frames that come one after another are held to that rhythm, so only
+    // then is the system asked for it.
+    Clock::time_point earliest = frameAt_ + 4ms;
+    if (const std::optional<Vsync> vsync = Clock::now() - frameAt_ < 100ms ? window_.GetVsync() : std::nullopt) {
+        const Clock::duration since = frameAt_ - vsync->at;
+        earliest = vsync->at + (since < Clock::duration::zero() ? -(-since / vsync->period) : since / vsync->period + 1) * vsync->period;
+    }
     bool pending = false;
     for (;;) {
         const Clock::time_point now = Clock::now();
@@ -190,6 +197,7 @@ Result<bool> Graphics::Begin() {
             Want(frameAt_ + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(std::max(*wish.due - time, 0.0))));
         }
     }
+    blur_.NewFrame();
     ImGui::NewFrame();
     if (input && input->AfterNewFrame()) {
         repaintAsked_ = true;
@@ -203,6 +211,13 @@ Result<> Graphics::Finish() {
         input->BeforeRender();
     }
     ImGui::Render();
+    // Before the frame goes to the window, which then has the two shown together.
+    const std::span<const BlurRegion> blurred = blur_.Collect(*context_, input ? input->GetLift() : 0.0f);
+    if (const auto placed = window_.SetBlur(blurred); !placed) {
+        // The interface is all there without it: the reason is told and the blur given up.
+        logger.Warn("{}", placed.error().message);
+        blur_ = Blur(false);
+    }
     ImDrawData& frame = *ImGui::GetDrawData();
     const uint64_t fresh = Fingerprint(frame);
     // Textures to create, update or destroy are work for the drawing even when the picture is the same.
@@ -215,7 +230,7 @@ Result<> Graphics::Finish() {
     const bool typing = input && input->AfterRender(window_.GetDisplayInfo());
 
     // A frame with nothing in it leaves nothing of the layer on the screen.
-    TRY(window_.SetVisible(frame.TotalVtxCount > 0));
+    TRY(window_.SetVisible(frame.TotalVtxCount > 0 || !blurred.empty()));
 
     const ImGuiIO& io = ImGui::GetIO();
     const Clock::time_point now = Clock::now();
@@ -274,6 +289,10 @@ NativeWindow& Graphics::GetWindow() {
 
 float Graphics::GetScale() const {
     return scale_;
+}
+
+Blur& Graphics::GetBlur() {
+    return blur_;
 }
 
 void Graphics::SetScale(float scale) {
